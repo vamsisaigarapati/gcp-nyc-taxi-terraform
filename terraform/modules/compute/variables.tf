@@ -22,15 +22,11 @@ variable "staging_bucket_name" {
   type = string
 }
 
-variable "warehouse_bucket_name" {
-  type = string
-}
-
-variable "connection_id" {
-  type = string
-}
-
 variable "dataset_id" {
+  type = string
+}
+
+variable "table_id" {
   type = string
 }
 

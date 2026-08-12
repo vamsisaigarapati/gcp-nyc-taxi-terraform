@@ -1,11 +1,20 @@
 # NYC Taxi Pipeline — Terraform
 
-Monthly ingestion of NYC TLC yellow-taxi parquet files into an Iceberg table
-on GCS, queryable from BigQuery via BigLake. The infrastructure is fully
-provisioned with Terraform; application code deploys through the same CI
-pipeline that applies it.
+Monthly ingestion of NYC TLC yellow-taxi parquet files into a native
+BigQuery table. The infrastructure is fully provisioned with Terraform;
+application code deploys through the same CI pipeline that applies it.
 
 Project: `nyc-taxi-terraform` · Region: `us-central1`
+
+New to this repo? Two companion docs go deeper than this README:
+- [`docs/HOW_TERRAFORM_WORKS.md`](docs/HOW_TERRAFORM_WORKS.md) — a
+  beginner-friendly walkthrough of how the `envs/dev` root module wires the
+  four child modules together, traced through one concrete example.
+- [`docs/CI_CD.md`](docs/CI_CD.md) — exactly what the GitHub Actions
+  pipeline does, where code physically goes, and why it authenticates with
+  an OIDC token instead of a stored key.
+- [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md) — the one-time `gcloud` commands
+  that had to run before Terraform could take over.
 
 ## Architecture
 
@@ -31,29 +40,25 @@ Project: `nyc-taxi-terraform` · Region: `us-central1`
                              │ invokes
                              v
              ┌────────────────────────────────┐
-             │ Cloud Function: dataproc-submit │  parses the event,
-             └───────────────┬─────────────────┘  submits a Dataproc batch
-                              │ Dataproc Batches API
+             │ Cloud Function: dataproc-submit │  parses the event, loads
+             └───────────────┬─────────────────┘  batch_config.json, submits
+                              │ Dataproc Batches API   a Dataproc batch
                               v
                 ┌──────────────────────────┐
-                │ Dataproc Serverless batch │  runs process_to_iceberg.py
-                └─────────────┬─────────────┘
-                               │ writes Iceberg data + metadata
-                               v
-                  ┌─────────────────────────┐
-                  │ GCS warehouse bucket     │  Iceberg table storage
-                  │ (BigLake Metastore       │
-                  │  catalog on top of it)   │
-                  └────────────┬─────────────┘
-                               │ read through the BigLake connection
+                │ Dataproc Serverless batch │  runs process_to_bigquery.py
+                └─────────────┬─────────────┘  (Spark BigQuery connector)
+                               │ stages rows via a temp GCS bucket,
+                               │ then loads them into BigQuery
                                v
                      ┌───────────────────┐
                      │     BigQuery       │  nyc_taxi_tf.yellow_tripdata
+                     │  (native table)     │  (native table)
                      └───────────────────┘
 ```
 
-Every arrow above is a service-account-scoped call — see [IAM design](#iam-design-service-accounts)
-below for exactly which identity makes which hop.
+Every arrow above is a service-account-scoped call — see
+[IAM design](#iam-design-service-accounts) below for exactly which identity
+makes which hop.
 
 ### Why Cloud Functions Gen2 instead of plain Cloud Run + Docker
 
@@ -74,20 +79,43 @@ Run, Cloud Functions, GKE, or Workflows. And a Terraform-declared
 time; it doesn't repeat itself every time a new monthly file lands. So
 Terraform's job here is to own the *infrastructure* (the receiver
 function, its service account, the code/staging buckets) — the receiver
-calls the Dataproc Batches API at runtime, once per new file, exactly the
-pattern the original prototype's `trigger_spark_job` function already
-proved out.
+calls the Dataproc Batches API at runtime, once per new file.
 
-### Why the PySpark job re-registers itself with BigQuery on every run
+### Why the Dataproc batch's compute shape lives in its own file
 
-BigLake Iceberg tables are exposed to BigQuery as external tables pointing
-at a specific Iceberg `metadata.json` location, and that location changes
-on every write. A Terraform-declared `google_bigquery_table` would be
-static and go stale after the first load. So `process_to_iceberg.py` ends
-each run with a `CREATE OR REPLACE EXTERNAL TABLE ... WITH CONNECTION ...
-OPTIONS (table_format = 'ICEBERG', storage_uri = '<latest metadata>')`
-call via the BigQuery REST API — the same "runtime owns what changes at
-runtime" split as the Dataproc submission above.
+`dataproc_submitter/main.py` only handles *event parsing and submission* —
+which file landed, is it a parquet, build a batch ID, call the API. The
+actual shape of the job it submits (Dataproc runtime version, executor
+count, executor cores/memory) lives in
+[`services/dataproc_submitter/batch_config.json`](services/dataproc_submitter/batch_config.json),
+loaded at runtime. Two reasons:
+
+- **Tuning the job shouldn't mean editing code.** Bumping executor count
+  is a data change to a JSON file, not a code change to the function that
+  parses GCS events.
+- **Dataproc Serverless silently picks a small default shape if you don't
+  set anything** (autoscaling driver + 2 executors on default machine
+  types). For a monthly batch of ~50–60MB parquet files that default is
+  probably fine, but leaving it implicit means nobody reviewing this repo
+  can see what it actually runs on. `batch_config.json` makes that an
+  explicit, version-controlled choice instead of an invisible default.
+
+### Direct write to BigQuery — no Iceberg/BigLake hop
+
+`process_to_bigquery.py` writes straight into a native BigQuery table
+using the Spark BigQuery connector (`format("bigquery")`), staging rows
+through the same GCS bucket Dataproc Serverless already uses for its own
+staging (`temporaryGcsBucket`). An earlier version of this pipeline routed
+through an Iceberg table on GCS with a BigLake Metastore catalog and a
+BigQuery external-table pointer — that added a warehouse bucket, a
+BigLake connection, extra IAM grants, and a REST-catalog sync step, for a
+capability (Iceberg time travel, engine-agnostic table format) this
+project doesn't currently need. Writing directly is simpler end to end.
+
+The dataset itself is Terraform-managed; the *table* inside it isn't —
+see the comment in `spark_jobs/process_to_bigquery.py` for why
+(`createDisposition=CREATE_IF_NEEDED` lets the job infer schema, since the
+NYC TLC source schema has changed across years).
 
 ## IAM design (service accounts)
 
@@ -101,85 +129,72 @@ needs:
 | `scheduler-invoker` | Cloud Scheduler job | `run.invoker` on the `fetch` function's service only |
 | `eventarc-trigger` | Eventarc trigger identity | `eventarc.eventReceiver` (project-scoped — no finer grain exists) + `run.invoker` on the `dataproc-submit` function |
 | `dataproc-submitter` | `dataproc-submit` Cloud Function | `dataproc.editor` (project-scoped) + `iam.serviceAccountUser` on `dataproc-runtime` (needed to submit a batch that runs *as* another SA) |
-| `dataproc-runtime` | The Spark batch itself | `storage.objectViewer` on raw + code buckets, `storage.objectAdmin` on warehouse + staging buckets, `bigquery.dataEditor` scoped to the dataset, `bigquery.jobUser` + `biglake.admin` (project-scoped) |
+| `dataproc-runtime` | The Spark batch itself | `storage.objectViewer` on raw + code buckets, `storage.objectAdmin` on the staging bucket (Dataproc's own staging *and* the BigQuery connector's temp bucket), `bigquery.dataEditor` scoped to the dataset, `bigquery.jobUser` (project-scoped — runs the load job the connector issues) |
 
-Two more grants that are easy to miss because neither identity is one we
-created:
-
-- **GCS's own service agent** (`service-{project_number}@gs-project-accounts.iam.gserviceaccount.com`)
-  needs `pubsub.publisher` at project level, or GCS→Eventarc triggers never
-  fire — GCS delivers finalize events by publishing to a Pub/Sub topic
-  Eventarc manages internally.
-- **The BigLake connection's auto-created service account** (output of
-  `google_bigquery_connection`) needs `storage.objectViewer` on the raw and
-  warehouse buckets, since BigQuery reads the underlying Iceberg files
-  through that identity at query time — separate from `dataproc-runtime`,
-  which is the *writer*.
+One more grant that's easy to miss because the identity isn't one we
+created: **GCS's own service agent**
+(`service-{project_number}@gs-project-accounts.iam.gserviceaccount.com`)
+needs `pubsub.publisher` at project level, or GCS→Eventarc triggers never
+fire — GCS delivers finalize events by publishing to a Pub/Sub topic
+Eventarc manages internally.
 
 ## Terraform design
 
 ```
 terraform/
   modules/
-    storage/    raw, warehouse, code, and Dataproc-staging GCS buckets
+    storage/    raw, code, and Dataproc-staging GCS buckets
     iam/        the 5 service accounts + every binding above
-    bigquery/   dataset, BigLake connection, dataset/bucket IAM grants
+    bigquery/   dataset + dataset/project IAM grants
     compute/    the 2 Cloud Functions, Cloud Scheduler job, Eventarc trigger
   envs/
     dev/        wires the 4 modules together; the only root module applied
 ```
 
-Design choices, and why:
+See [`docs/HOW_TERRAFORM_WORKS.md`](docs/HOW_TERRAFORM_WORKS.md) for a full
+walkthrough of the mechanics. Short version of the design choices:
 
 - **One module per GCP surface area, not per pipeline stage.** `storage`
   owns every bucket regardless of which stage writes to it; `iam` owns
   every service account regardless of which stage runs as it. This keeps
-  IAM auditable in one place (`terraform plan` against just the `iam`
-  module shows every grant in the stack) instead of scattered across
-  stage-shaped modules.
+  IAM auditable in one place — `terraform plan` against just the `iam`
+  module shows every grant in the stack.
 - **Dependency order matches the data flow**: `storage` has no
-  dependencies → `iam` needs bucket names (for bucket-scoped bindings) →
-  `bigquery` needs bucket names + the `dataproc-runtime` email (for
-  dataset-scoped bindings) → `compute` needs everything (function env vars
-  reference bucket names, the BigLake connection ID, and every service
-  account email). `envs/dev/main.tf` wires them in that order via module
-  outputs, so Terraform's own dependency graph enforces it — no manual
-  `depends_on` chains beyond the couple of explicit ones needed for IAM
-  bindings that must exist before a resource that relies on them (e.g. the
-  Scheduler job depends on its `run.invoker` binding existing first).
+  dependencies → `iam` needs bucket names (bucket-scoped bindings) →
+  `bigquery` needs the `dataproc-runtime` email (dataset-scoped bindings)
+  → `compute` needs everything (function env vars reference bucket names,
+  the dataset/table id, and every service account email). `envs/dev/main.tf`
+  wires them in that order via module outputs, so Terraform's own
+  dependency graph enforces it.
 - **`envs/dev` as the only state-carrying root module.** The four modules
   under `modules/` are pure building blocks with no backend config of
-  their own; only `envs/dev` has a `backend.tf`. Adding a second
-  environment later means a new `envs/<name>/` directory reusing the same
-  modules with a different `terraform.tfvars` and state prefix — no
-  changes to the modules themselves.
+  their own; only `envs/dev` has a `backend.tf`. A second environment
+  later means a new `envs/<name>/` directory reusing the same modules with
+  different `terraform.tfvars` — no changes to the modules themselves.
 - **Naming is entirely `${project_id}-${name_prefix}-*`.** Every bucket,
   service account, function, and job name derives from the two variables
-  in `terraform.tfvars` (`project_id`, `name_prefix`). This is what makes
-  this a "fresh, separate stack" — running it against a project that
-  already has a hand-built version of this pipeline (as the original
-  prototype project does) can't collide with it, since GCS bucket names
-  are globally unique and every name here is prefixed by the project ID.
+  in `terraform.tfvars`. This is what makes this a "fresh, separate stack"
+  — it can't collide with a hand-built version of this pipeline in the
+  same or a different project, since GCS bucket names are globally unique
+  and every name here is prefixed by the project ID.
 - **`archive_file` + `google_storage_bucket_object` drive function
   deploys.** The `compute` module zips `services/fetch/` and
   `services/dataproc_submitter/` locally, uploads each zip under a
   content-hashed object name, and points the Cloud Function at that
   object. A code change produces a new hash, a new object, and a new
-  function revision — `terraform apply` alone is a complete code deploy,
-  which is what lets the CI pipeline in `.github/workflows/terraform.yml`
-  be a single `terraform apply` rather than a separate build/push step.
+  function revision — `terraform apply` alone is a complete code deploy.
+  See `docs/CI_CD.md` for the full path a code change takes through CI.
 - **APIs are enabled from the root module** (`envs/dev/main.tf`,
   `google_project_service` over a list), not from inside each module —
-  API enablement is project-wide, so it belongs at the level that owns
-  the project, and every module that needs an API `depends_on` that one
-  resource.
+  API enablement is project-wide, so it belongs at the level that owns the
+  project.
 
 ## Bootstrap: resources created outside Terraform, and why
 
 A handful of resources have to exist *before* `terraform init` can work at
 all — Terraform can't create the backend it stores its own state in, or
 the identity it authenticates as. These were created once, by hand, via
-`gcloud` (full commands in `docs/BOOTSTRAP.md`):
+`gcloud` (full commands in [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md)):
 
 | Resource | Why it can't be Terraform-managed |
 |---|---|
@@ -187,7 +202,7 @@ the identity it authenticates as. These were created once, by hand, via
 | `cloudscheduler`, `cloudresourcemanager`, `sts`, `compute` APIs | `cloudresourcemanager`/`sts` are needed for Terraform itself and for Workload Identity Federation token exchange; the rest gate the very first `google_project_service` apply |
 | GCS bucket `nyc-taxi-terraform-tf-state` (versioned) | This *is* the Terraform backend — a backend can't provision itself |
 | Service account `ci-deployer` + 11 project-level admin roles | The identity GitHub Actions authenticates as; it needs enough IAM to create everything the main config manages (functions, buckets, service accounts, IAM bindings, BigQuery, Eventarc, Scheduler) |
-| Workload Identity Federation pool + OIDC provider, scoped to `vamsisaigarapati`'s GitHub account | Lets GitHub Actions impersonate `ci-deployer` via short-lived OIDC tokens — no static JSON service-account key ever leaves GCP |
+| Workload Identity Federation pool + OIDC provider, scoped to `vamsisaigarapati`'s GitHub account | Lets GitHub Actions impersonate `ci-deployer` via short-lived OIDC tokens — no static JSON service-account key ever leaves GCP. Full explanation in `docs/CI_CD.md`. |
 | `ci-deployer` ← `roles/iam.workloadIdentityUser` binding, scoped to *this exact repo* | Without this, any repo under the account (not just this one) could mint tokens against the pool |
 
 Everything below that line — every bucket, service account, function,
@@ -203,10 +218,13 @@ terraform/
 services/
   fetch/                 # Cloud Function: pulls the monthly parquet file
   dataproc_submitter/    # Cloud Function: Eventarc target, submits the Spark batch
+    batch_config.json    # compute shape for the Dataproc batch, kept out of the code
 spark_jobs/
-  process_to_iceberg.py  # Runs inside the Dataproc Serverless batch
+  process_to_bigquery.py # Runs inside the Dataproc Serverless batch
 docs/
   BOOTSTRAP.md           # exact one-time gcloud commands from the table above
+  HOW_TERRAFORM_WORKS.md # module wiring walkthrough, for Terraform beginners
+  CI_CD.md                # what GitHub Actions does + the OIDC auth chain
 ```
 
 ## CI/CD
@@ -214,10 +232,8 @@ docs/
 `.github/workflows/terraform.yml`: a `lint` job (flake8 over `services/`
 and `spark_jobs/`) gates two others — `plan` on pull requests (fmt check,
 validate, plan, authenticated via WIF, no static credentials) and `apply`
-on pushes to `main`. Since the Cloud Functions deploy is just another
-Terraform resource (see [Terraform design](#terraform-design) above),
-`terraform apply` is the entire deploy — infra and app code land together,
-in one plan.
+on pushes to `main`. Full breakdown, including the OIDC auth chain, in
+[`docs/CI_CD.md`](docs/CI_CD.md).
 
 ## Running locally
 

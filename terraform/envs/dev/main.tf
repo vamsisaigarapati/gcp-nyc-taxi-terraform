@@ -9,8 +9,6 @@ locals {
     "dataproc.googleapis.com",
     "storage.googleapis.com",
     "bigquery.googleapis.com",
-    "bigqueryconnection.googleapis.com",
-    "biglake.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
     "compute.googleapis.com",
@@ -64,10 +62,7 @@ module "bigquery" {
 
   project_id             = var.project_id
   region                 = var.region
-  name_prefix            = var.name_prefix
   dataset_id             = var.dataset_id
-  raw_bucket_name        = module.storage.raw_bucket_name
-  warehouse_bucket_name  = module.storage.warehouse_bucket_name
   dataproc_runtime_email = module.iam.dataproc_runtime_email
 }
 
@@ -78,13 +73,12 @@ module "compute" {
   region      = var.region
   name_prefix = var.name_prefix
 
-  raw_bucket_name       = module.storage.raw_bucket_name
-  code_bucket_name      = module.storage.code_bucket_name
-  staging_bucket_name   = module.storage.staging_bucket_name
-  warehouse_bucket_name = module.storage.warehouse_bucket_name
+  raw_bucket_name     = module.storage.raw_bucket_name
+  code_bucket_name    = module.storage.code_bucket_name
+  staging_bucket_name = module.storage.staging_bucket_name
 
-  connection_id = module.bigquery.connection_id
-  dataset_id    = module.bigquery.dataset_id
+  dataset_id = module.bigquery.dataset_id
+  table_id   = var.table_id
 
   fetch_runner_email       = module.iam.fetch_runner_email
   scheduler_invoker_email  = module.iam.scheduler_invoker_email
@@ -96,5 +90,5 @@ module "compute" {
 
   fetch_source_dir     = "${path.module}/../../../services/fetch"
   submitter_source_dir = "${path.module}/../../../services/dataproc_submitter"
-  pyspark_script_path  = "${path.module}/../../../spark_jobs/process_to_iceberg.py"
+  pyspark_script_path  = "${path.module}/../../../spark_jobs/process_to_bigquery.py"
 }

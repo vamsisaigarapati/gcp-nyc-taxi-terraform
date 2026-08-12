@@ -16,7 +16,13 @@ variable "name_prefix" {
 }
 
 variable "dataset_id" {
-  description = "BigQuery dataset id for the Iceberg table"
+  description = "BigQuery dataset id for the taxi table"
   type        = string
   default     = "nyc_taxi_tf"
+}
+
+variable "table_id" {
+  description = "BigQuery table id the Spark job writes to (created by the job itself, not Terraform)"
+  type        = string
+  default     = "yellow_tripdata"
 }

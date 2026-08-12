@@ -1,5 +1,7 @@
+import json
 import os
 import time
+from pathlib import Path
 
 import functions_framework
 from google.cloud import dataproc_v1
@@ -11,18 +13,14 @@ SUBNETWORK = os.environ["DATAPROC_SUBNETWORK"]
 SERVICE_ACCOUNT = os.environ["DATAPROC_SERVICE_ACCOUNT"]
 STAGING_BUCKET = os.environ["STAGING_BUCKET"]
 PYSPARK_FILE_URI = os.environ["PYSPARK_FILE_URI"]
-ICEBERG_RUNTIME_JAR_URI = os.environ.get(
-    "ICEBERG_RUNTIME_JAR_URI",
-    "gs://spark-lib/iceberg/iceberg-spark-runtime-3.5_2.12-1.6.1.jar",
-)
-BIGLAKE_JAR_URI = os.environ.get(
-    "BIGLAKE_JAR_URI",
-    "gs://spark-lib/biglake/biglake-catalog-iceberg1.5.1-0.1.2-with-dependencies.jar",
-)
-BLMS_CATALOG = os.environ["BLMS_CATALOG"]
-ICEBERG_WAREHOUSE = os.environ["ICEBERG_WAREHOUSE"]
-BQ_CONNECTION = os.environ["BQ_CONNECTION"]
-BQ_DATASET = os.environ["BQ_DATASET"]
+BQ_TABLE = os.environ["BQ_TABLE"]  # fully qualified: project.dataset.table
+
+# Compute shape (machine sizing, Spark properties, runtime image version)
+# lives in its own file rather than here, so tuning the job doesn't mean
+# editing the code that submits it. See batch_config.json for why.
+_CONFIG_PATH = Path(__file__).parent / "batch_config.json"
+with open(_CONFIG_PATH) as f:
+    _batch_config = json.load(f)
 
 
 @functions_framework.cloud_event
@@ -31,8 +29,7 @@ def trigger_spark_job(cloud_event):
 
     Fires on every new object finalized in RAW_BUCKET. Filters down to
     parquet files, then submits a Dataproc Serverless Spark batch that
-    loads that single file into the Iceberg lakehouse table via the
-    BigLake Metastore catalog.
+    loads that single file straight into a native BigQuery table.
     """
     data = cloud_event.data
     bucket = data.get("bucket")
@@ -56,22 +53,11 @@ def trigger_spark_job(cloud_event):
 
     batch = dataproc_v1.Batch()
     batch.pyspark_batch.main_python_file_uri = PYSPARK_FILE_URI
-    batch.pyspark_batch.args.extend([gcs_uri])
-    batch.pyspark_batch.jar_file_uris.extend([ICEBERG_RUNTIME_JAR_URI, BIGLAKE_JAR_URI])
-    batch.runtime_config.properties.update(
-        {
-            "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-            "spark.sql.catalog.lakehouse": "org.apache.iceberg.spark.SparkCatalog",
-            "spark.sql.catalog.lakehouse.catalog-impl": "org.apache.iceberg.gcp.biglake.BigLakeCatalog",
-            "spark.sql.catalog.lakehouse.gcp_project": PROJECT_ID,
-            "spark.sql.catalog.lakehouse.gcp_location": REGION,
-            "spark.sql.catalog.lakehouse.blms_catalog": BLMS_CATALOG,
-            "spark.sql.catalog.lakehouse.warehouse": ICEBERG_WAREHOUSE,
-            "spark.sql.defaultCatalog": "lakehouse",
-            "spark.taxi.bq_connection": f"{PROJECT_ID}.{REGION}.{BQ_CONNECTION}",
-            "spark.taxi.bq_dataset": f"{PROJECT_ID}.{BQ_DATASET}",
-        }
-    )
+    batch.pyspark_batch.args.extend([gcs_uri, BQ_TABLE, STAGING_BUCKET])
+
+    batch.runtime_config.version = _batch_config["runtime_version"]
+    batch.runtime_config.properties.update(_batch_config["properties"])
+
     batch.environment_config.execution_config.subnetwork_uri = SUBNETWORK
     batch.environment_config.execution_config.service_account = SERVICE_ACCOUNT
     batch.environment_config.execution_config.staging_bucket = STAGING_BUCKET
@@ -83,4 +69,4 @@ def trigger_spark_job(cloud_event):
     )
 
     client.create_batch(request=request)
-    print(f"Submitted Dataproc Serverless batch '{batch_id}' for {gcs_uri}")
+    print(f"Submitted Dataproc Serverless batch '{batch_id}' for {gcs_uri} -> {BQ_TABLE}")

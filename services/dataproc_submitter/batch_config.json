@@ -1,0 +1,11 @@
+{
+  "_comment": "Dataproc Serverless compute shape for the PySpark batch. Kept out of main.py so 'how big a job runs' is a data change, not a code change. Dataproc Serverless auto-picks a default shape if none of this is set (small, autoscaling driver+2 executors) -- this file makes that an explicit, reviewable choice instead of an invisible default.",
+  "runtime_version": "2.2",
+  "properties": {
+    "spark.executor.instances": "2",
+    "spark.driver.cores": "4",
+    "spark.executor.cores": "4",
+    "spark.executor.memory": "6g",
+    "spark.dynamicAllocation.enabled": "false"
+  }
+}

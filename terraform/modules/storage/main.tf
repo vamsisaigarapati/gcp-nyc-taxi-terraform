@@ -19,17 +19,7 @@ resource "google_storage_bucket" "raw" {
   }
 }
 
-# Iceberg table data + metadata files, read by both the Spark writer and
-# BigQuery (via the BigLake connection) at query time.
-resource "google_storage_bucket" "warehouse" {
-  name                        = "${var.project_id}-${var.name_prefix}-warehouse"
-  project                     = var.project_id
-  location                    = var.region
-  uniform_bucket_level_access = true
-  force_destroy               = false
-}
-
-# Cloud Function source zips + the PySpark script/jars referenced by the
+# Cloud Function source zips + the PySpark script referenced by the
 # Dataproc Serverless batch. Versioned implicitly via content-hashed object
 # names rather than bucket versioning.
 resource "google_storage_bucket" "code" {
@@ -40,7 +30,9 @@ resource "google_storage_bucket" "code" {
   force_destroy               = false
 }
 
-# Dataproc Serverless working/staging area. Short-lived by design, so
+# Dual-purpose scratch space: Dataproc Serverless's own working/staging
+# area, and the temporary GCS bucket the Spark BigQuery connector stages
+# rows through before loading them into BigQuery. Short-lived by design, so
 # force_destroy + an aggressive lifecycle rule are appropriate here (unlike
 # the other buckets).
 resource "google_storage_bucket" "dataproc_staging" {

@@ -1,7 +1,3 @@
-locals {
-  blms_catalog = "${replace(var.name_prefix, "-", "_")}_lakehouse"
-}
-
 # --- fetch function -----------------------------------------------------
 
 data "archive_file" "fetch_zip" {
@@ -91,7 +87,7 @@ resource "google_storage_bucket_object" "submitter_zip" {
 }
 
 resource "google_storage_bucket_object" "pyspark_script" {
-  name   = "spark_jobs/process_to_iceberg.py"
+  name   = "spark_jobs/process_to_bigquery.py"
   bucket = var.code_bucket_name
   source = var.pyspark_script_path
 }
@@ -126,11 +122,8 @@ resource "google_cloudfunctions2_function" "dataproc_submitter" {
       DATAPROC_SUBNETWORK      = var.subnetwork_self_link
       DATAPROC_SERVICE_ACCOUNT = var.dataproc_runtime_email
       PYSPARK_FILE_URI         = "gs://${var.code_bucket_name}/${google_storage_bucket_object.pyspark_script.name}"
-      ICEBERG_WAREHOUSE        = "gs://${var.warehouse_bucket_name}/warehouse"
-      BLMS_CATALOG             = local.blms_catalog
       STAGING_BUCKET           = var.staging_bucket_name
-      BQ_CONNECTION            = var.connection_id
-      BQ_DATASET               = var.dataset_id
+      BQ_TABLE                 = "${var.project_id}.${var.dataset_id}.${var.table_id}"
     }
   }
 }
