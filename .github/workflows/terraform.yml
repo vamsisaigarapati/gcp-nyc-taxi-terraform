@@ -1,0 +1,88 @@
+name: Terraform
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - "services/**"
+      - "spark_jobs/**"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "services/**"
+      - "spark_jobs/**"
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  WORKING_DIR: terraform/envs/dev
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install flake8
+      - run: flake8 services spark_jobs --max-line-length=110
+
+  plan:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/611725370097/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+          service_account: ci-deployer@project-170b4595-4499-48a4-998.iam.gserviceaccount.com
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: .
+
+      - name: terraform init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: terraform validate
+        run: terraform validate
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: terraform plan
+        if: github.event_name == 'pull_request'
+        run: terraform plan -no-color
+        working-directory: ${{ env.WORKING_DIR }}
+
+  apply:
+    needs: lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/611725370097/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+          service_account: ci-deployer@project-170b4595-4499-48a4-998.iam.gserviceaccount.com
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: terraform init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR }}
+
+      - name: terraform apply
+        run: terraform apply -auto-approve
+        working-directory: ${{ env.WORKING_DIR }}
