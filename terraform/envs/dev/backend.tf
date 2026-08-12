@@ -2,7 +2,7 @@
 # can be initialized — a Terraform-managed backend can't bootstrap itself.
 terraform {
   backend "gcs" {
-    bucket = "project-170b4595-4499-48a4-998-tf-state"
+    bucket = "nyc-taxi-terraform-tf-state"
     prefix = "nyc-taxi-pipeline/dev"
   }
 }

@@ -41,8 +41,8 @@ jobs:
       - id: auth
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/611725370097/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
-          service_account: ci-deployer@project-170b4595-4499-48a4-998.iam.gserviceaccount.com
+          workload_identity_provider: projects/787209049782/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+          service_account: ci-deployer@nyc-taxi-terraform.iam.gserviceaccount.com
 
       - uses: hashicorp/setup-terraform@v3
 
@@ -74,8 +74,8 @@ jobs:
       - id: auth
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: projects/611725370097/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
-          service_account: ci-deployer@project-170b4595-4499-48a4-998.iam.gserviceaccount.com
+          workload_identity_provider: projects/787209049782/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
+          service_account: ci-deployer@nyc-taxi-terraform.iam.gserviceaccount.com
 
       - uses: hashicorp/setup-terraform@v3
 
