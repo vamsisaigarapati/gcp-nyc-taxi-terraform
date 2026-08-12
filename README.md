@@ -7,9 +7,6 @@ application code deploys through the same CI pipeline that applies it.
 Project: `nyc-taxi-terraform` · Region: `us-central1`
 
 New to this repo? Two companion docs go deeper than this README:
-- [`docs/HOW_TERRAFORM_WORKS.md`](docs/HOW_TERRAFORM_WORKS.md) — a
-  beginner-friendly walkthrough of how the `envs/dev` root module wires the
-  four child modules together, traced through one concrete example.
 - [`docs/CI_CD.md`](docs/CI_CD.md) — exactly what the GitHub Actions
   pipeline does, where code physically goes, and why it authenticates with
   an OIDC token instead of a stored key.
@@ -129,7 +126,7 @@ needs:
 | `scheduler-invoker` | Cloud Scheduler job | `run.invoker` on the `fetch` function's service only |
 | `eventarc-trigger` | Eventarc trigger identity | `eventarc.eventReceiver` (project-scoped — no finer grain exists) + `run.invoker` on the `dataproc-submit` function |
 | `dataproc-submitter` | `dataproc-submit` Cloud Function | `dataproc.editor` (project-scoped) + `iam.serviceAccountUser` on `dataproc-runtime` (needed to submit a batch that runs *as* another SA) |
-| `dataproc-runtime` | The Spark batch itself | `storage.objectViewer` on raw + code buckets, `storage.objectAdmin` on the staging bucket (Dataproc's own staging *and* the BigQuery connector's temp bucket), `bigquery.dataEditor` scoped to the dataset, `bigquery.jobUser` (project-scoped — runs the load job the connector issues) |
+| `dataproc-runtime` | The Spark batch itself | `storage.objectViewer` on raw + code buckets, `storage.objectAdmin` on the staging bucket (Dataproc's own staging *and* the BigQuery connector's temp bucket), `bigquery.dataEditor` scoped to the dataset, `bigquery.jobUser` (project-scoped — runs the load job the connector issues), `dataproc.worker` (project-scoped — lets the Dataproc agent inside the batch register itself and report status; without it, batches fail within seconds, before Spark even starts) |
 
 One more grant that's easy to miss because the identity isn't one we
 created: **GCS's own service agent**
@@ -151,8 +148,7 @@ terraform/
     dev/        wires the 4 modules together; the only root module applied
 ```
 
-See [`docs/HOW_TERRAFORM_WORKS.md`](docs/HOW_TERRAFORM_WORKS.md) for a full
-walkthrough of the mechanics. Short version of the design choices:
+Design choices, and why:
 
 - **One module per GCP surface area, not per pipeline stage.** `storage`
   owns every bucket regardless of which stage writes to it; `iam` owns
@@ -209,6 +205,57 @@ Everything below that line — every bucket, service account, function,
 dataset, scheduler job, and trigger the pipeline actually runs on — is
 Terraform-managed, defined in `terraform/`.
 
+## Issues hit standing this up, and how they were diagnosed
+
+None of these were guessed — each was traced to a root cause via live GCP
+state (build logs, IAM policy dumps, Dataproc batch `stateMessage`, direct
+authenticated requests) before being fixed.
+
+1. **Cloud Function builds failed with "missing permission on the build
+   service account."** Root cause: an org policy,
+   `iam.automaticIamGrantsForDefaultServiceAccounts`, enforced at the
+   `vamcsaig-org` level, disables GCP's usual behavior of auto-granting
+   roles to default/service-agent identities the first time you use a
+   service. This surfaced three times in a row, once per identity that
+   normally gets an automatic grant: the Cloud Build service account
+   needed `artifactregistry.writer` (to push the built image) and
+   `logging.logWriter` (to write build logs); the Cloud Functions service
+   agent needed `artifactregistry.reader` (to read the auto-created
+   `gcf-artifacts` repo); the default Compute Engine service account
+   (which Cloud Functions Gen2 actually runs the buildpacks build as)
+   needed `storage.objectViewer` (to read the uploaded source zip). Fixed
+   with one-off `gcloud projects add-iam-policy-binding` grants — these
+   are Google-internal build-plumbing identities, not part of this
+   pipeline's own IAM design (see [IAM design](#iam-design-service-accounts)
+   above for the identities that *are*).
+2. **`Error creating Trigger: ... Bucket location "us" does not match
+   trigger location "us-central1"`.** The raw bucket was multi-region
+   `"US"`; Eventarc requires a GCS-triggered trigger's location to exactly
+   match its bucket's location, and the trigger here is necessarily
+   regional (its destination, the submitter Cloud Function, lives in
+   `us-central1`). Fixed by making the raw bucket regional too — see the
+   comment on `google_storage_bucket.raw` in
+   `terraform/modules/storage/main.tf`.
+3. **Dataproc batches failed within ~5 seconds, before Spark ever
+   started.** The batch's own `stateMessage` named the exact cause:
+   `dataproc-runtime` was missing `roles/dataproc.worker`. This is a
+   distinct requirement from *data* access (storage/BigQuery roles it
+   already had) — any custom service account used as a Dataproc batch's
+   execution identity needs it so the Dataproc agent inside the batch's
+   environment can register itself and report status back to the control
+   plane at all. Added to `terraform/modules/iam/main.tf`.
+4. **A Cloud Scheduler-triggered run looked like an infrastructure
+   failure (502) but wasn't.** Invoking the `fetch` function directly
+   (bypassing Scheduler, with a properly scoped identity token) showed it
+   ran successfully and returned its own, deliberate `502` for "this
+   month's file isn't published on the NYC TLC CDN yet." The bug: `502`
+   is also Cloud Run's own status code for "your container crashed,"
+   so the two failure modes were indistinguishable from the outside.
+   Changed to `404` in `services/fetch/main.py`, and separately fixed the
+   underlying cause — NYC TLC's publishing lag was longer than assumed, so
+   `fetch` now requests the same month two years back rather than N months
+   before "today," which is always safely past the lag.
+
 ## Layout
 
 ```
@@ -223,7 +270,6 @@ spark_jobs/
   process_to_bigquery.py # Runs inside the Dataproc Serverless batch
 docs/
   BOOTSTRAP.md           # exact one-time gcloud commands from the table above
-  HOW_TERRAFORM_WORKS.md # module wiring walkthrough, for Terraform beginners
   CI_CD.md                # what GitHub Actions does + the OIDC auth chain
 ```
 

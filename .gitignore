@@ -5,6 +5,8 @@
 !*.tfstate.lock.info
 .build/
 *.zip
+tfplan*
+*.tfplan
 __pycache__/
 *.pyc
 .DS_Store

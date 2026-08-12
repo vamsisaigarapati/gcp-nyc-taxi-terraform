@@ -1,10 +1,13 @@
-# Landing zone for untouched NYC TLC parquet files. Multi-region US to match
-# the CloudFront source's spread and keep egress cheap regardless of which
-# region ends up reading it.
+# Landing zone for untouched NYC TLC parquet files. Regional, matching
+# var.region — not multi-region "US" — because the Eventarc trigger that
+# watches this bucket for new objects must be created in exactly the same
+# location as the bucket itself (GCP rejects "US" + "us-central1" as a
+# mismatch), and the trigger's destination (the submitter Cloud Function)
+# is regional in us-central1 anyway.
 resource "google_storage_bucket" "raw" {
   name                        = "${var.project_id}-${var.name_prefix}-raw"
   project                     = var.project_id
-  location                    = "US"
+  location                    = var.region
   uniform_bucket_level_access = true
   force_destroy               = false
 

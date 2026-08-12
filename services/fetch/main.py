@@ -10,12 +10,9 @@ BUCKET_NAME = os.environ["BUCKET_NAME"]
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
 
 
-def _previous_month():
+def _same_month_years_ago(n):
     today = date.today()
-    year, month = today.year, today.month - 1
-    if month == 0:
-        year, month = year - 1, 12
-    return year, month
+    return today.year - n, today.month
 
 
 @functions_framework.http
@@ -24,7 +21,11 @@ def fetch_raw_data(request):
 
     Accepts optional `year`/`month` (query params or JSON body). When
     omitted — as on the monthly Cloud Scheduler trigger, whose HTTP body is
-    static — defaults to last month, since NYC TLC publishes with a lag.
+    static — defaults to the same month, two years back (e.g. a run in
+    August 2026 fetches August 2024; a run the following month fetches
+    September 2024). That's comfortably past NYC TLC's publishing lag, so
+    every run resolves to a real, already-published file without needing
+    to special-case "is this month out yet."
     Downloads the corresponding yellow taxi parquet file and streams it
     straight into the raw GCS bucket.
     """
@@ -35,7 +36,7 @@ def fetch_raw_data(request):
     month = request_json.get("month", request_args.get("month"))
 
     if year is None or month is None:
-        year, month = _previous_month()
+        year, month = _same_month_years_ago(2)
 
     try:
         year = int(year)
@@ -51,7 +52,12 @@ def fetch_raw_data(request):
 
     response = requests.get(url, stream=True, timeout=60)
     if response.status_code != 200:
-        return jsonify({"error": f"{url} is not available"}), 502
+        # 404, not 502 — this is "the requested month isn't published yet",
+        # a normal/expected outcome, not a server failure. 502 is reserved
+        # by Cloud Run itself for "the container failed" and produces an
+        # identical-looking error to a real infra problem, which is
+        # actively misleading when triaging.
+        return jsonify({"error": f"{url} is not available"}), 404
 
     storage_client = storage.Client()
     bucket = storage_client.bucket(BUCKET_NAME)

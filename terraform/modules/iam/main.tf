@@ -54,6 +54,17 @@ resource "google_storage_bucket_iam_member" "dataproc_runtime_staging_admin" {
   member = "serviceAccount:${google_service_account.dataproc_runtime.email}"
 }
 
+# Any custom service account used as a Dataproc batch's execution identity
+# needs this, separate from whatever data access it needs — it's what lets
+# the Dataproc agent inside the batch's environment register itself, lease
+# tasks, and report status back to the control plane. Without it, batches
+# fail within seconds, before Spark itself ever starts.
+resource "google_project_iam_member" "dataproc_runtime_worker" {
+  project = var.project_id
+  role    = "roles/dataproc.worker"
+  member  = "serviceAccount:${google_service_account.dataproc_runtime.email}"
+}
+
 # --- dataproc-submitter: project-scoped batch submission --------------------
 # Dataproc batches have no finer-grained resource IAM than project level.
 resource "google_project_iam_member" "dataproc_submitter_editor" {
